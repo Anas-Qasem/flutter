@@ -18,6 +18,7 @@
         "--no-stripped",
         "--no-lto",
         "--xcode-symlinks",
+        "--mac-system-ld",
         "--rbe",
         "--no-goma"
       ],
@@ -52,6 +53,7 @@
         "--no-stripped",
         "--no-lto",
         "--xcode-symlinks",
+        "--mac-system-ld",
         "--rbe",
         "--no-goma"
       ],
@@ -85,6 +87,7 @@
         "--no-stripped",
         "--no-lto",
         "--xcode-symlinks",
+        "--mac-system-ld",
         "--rbe",
         "--no-goma"
       ],
@@ -118,6 +121,7 @@
         "--no-stripped",
         "--no-lto",
         "--xcode-symlinks",
+        "--mac-system-ld",
         "--rbe",
         "--no-goma"
       ],
@@ -152,6 +156,7 @@
         "--no-stripped",
         "--no-lto",
         "--xcode-symlinks",
+        "--mac-system-ld",
         "--rbe",
         "--no-goma"
       ],
@@ -188,6 +193,7 @@
         "--no-stripped",
         "--no-lto",
         "--xcode-symlinks",
+        "--mac-system-ld",
         "--rbe",
         "--no-goma"
       ],
@@ -618,6 +624,7 @@
         "--no-stripped",
         "--no-lto",
         "--xcode-symlinks",
+        "--mac-system-ld",
         "--rbe",
         "--no-goma"
       ],
@@ -651,6 +658,7 @@
         "--mac-cpu",
         "arm64",
         "--xcode-symlinks",
+        "--mac-system-ld",
         "--rbe",
         "--no-goma"
       ],
@@ -684,6 +692,7 @@
         "--mac-cpu",
         "arm64",
         "--xcode-symlinks",
+        "--mac-system-ld",
         "--rbe",
         "--no-goma"
       ],
@@ -717,6 +726,7 @@
         "--mac-cpu",
         "arm64",
         "--xcode-symlinks",
+        "--mac-system-ld",
         "--rbe",
         "--no-goma"
       ],
@@ -855,6 +865,7 @@
         "--no-stripped",
         "--no-lto",
         "--xcode-symlinks",
+        "--mac-system-ld",
         "--rbe",
         "--no-goma"
       ],
@@ -939,6 +950,7 @@
         "--no-stripped",
         "--no-lto",
         "--xcode-symlinks",
+        "--mac-system-ld",
         "--rbe",
         "--no-goma"
       ],

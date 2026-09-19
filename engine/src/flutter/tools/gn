@@ -309,6 +309,30 @@ def setup_apple_sdks():
   return sdks_gn_args
 
 
+# Returns a mapping of gn variables for pointing clang at Xcode's own `ld`
+# instead of the vendored ld64.lld, when requested via --mac-system-ld.
+#
+# QURAN BUILD: Xcode 27's SDK .tbd stubs list `arm64e.x1` targets the
+# vendored ld64.lld (Fuchsia LLD 23) rejects as "unknown architecture",
+# failing every Mac/iOS link on such a host with "malformed file". Xcode's
+# own `ld` understands its own SDK's .tbd format.
+def setup_mac_ld(args):
+  mac_ld_gn_args = {}
+  if not args.mac_system_ld:
+    return mac_ld_gn_args
+  if get_host_os() != 'mac':
+    return mac_ld_gn_args
+  try:
+    ld_path = subprocess.check_output(['xcrun', '-f', 'ld']).decode('utf-8').strip()
+  except (subprocess.CalledProcessError, OSError) as error:
+    raise Exception(
+        '--mac-system-ld requires `xcrun` (Xcode command line tools) to '
+        'locate the system linker, but it could not be run: %s' % error
+    )
+  mac_ld_gn_args['mac_ld_path'] = ld_path
+  return mac_ld_gn_args
+
+
 def get_repository_version(repository):
   'Returns the Git HEAD for the supplied repository path as a string.'
   if not os.path.exists(repository):
@@ -553,6 +577,7 @@ def to_gn_args(args):
       gn_args['use_ios_simulator'] = False
     gn_args['ios_use_simulator'] = gn_args['use_ios_simulator']
     gn_args.update(setup_apple_sdks())
+    gn_args.update(setup_mac_ld(args))
 
   # Make the Dart VM include a simulator, even though it is generating arm64
   # code on an arm64 device, so that it can fall back to interpreting the arm64
@@ -1066,6 +1091,16 @@ def parse_args(args):
   )
   parser.add_argument(
       '--no-xcode-symlinks', dest='xcode_symlinks', default=False, action='store_false'
+  )
+  parser.add_argument(
+      '--mac-system-ld',
+      action='store_true',
+      default=False,
+      help='QURAN BUILD: point clang at Xcode\'s own `ld` instead of the '
+      'vendored ld64.lld for Mac/iOS links. Xcode 27\'s SDK .tbd stubs list '
+      '`arm64e.x1` targets the vendored linker (Fuchsia LLD) rejects as '
+      '"unknown architecture", failing every Mac/iOS link on such a host. '
+      'No effect on a non-mac host or when unset.'
   )
   parser.add_argument(
       '--depot-tools',
