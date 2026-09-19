@@ -1100,6 +1100,31 @@ void FirstPassDispatcher::drawText(const std::shared_ptr<flutter::DlText>& text,
     return;
   }
 
+  // QURAN PATCH 007 (F1): don't register a frame the canvas pass will draw as
+  // a vector path — the lazy glyph atlas only needs to know about frames it
+  // will actually rasterize. Only kMonoPath and kColorPaths are skipped here,
+  // never kOversizePath, even though it is also drawn as a path: kMonoPath
+  // and kColorPaths depend only on the paint's own attributes and this
+  // frame's immutable tables, so this first pass and Canvas::DrawTextFrame
+  // (which asks the identical question via TextFrame::ChooseDrawMode) cannot
+  // disagree about them. kOversizePath additionally depends on the transform
+  // in effect when the canvas pass actually draws — which, per the dispatch
+  // note at the top of this file, is not guaranteed to see the exact same
+  // sequence of ops as this first pass. Skipping a frame the atlas is asked
+  // to draw drops its glyphs silently (TextContents::Render, "Frame bounds
+  // are not present in the atlas"); registering an extra kOversizePath frame
+  // that never reaches the atlas costs nothing unless another frame sharing
+  // its atlas type does get drawn from the atlas in the same frame. Given
+  // that asymmetry, keep registering kOversizePath and only skip the two
+  // paint-attribute-only modes.
+  TextFrame::DrawMode draw_mode =
+      text_frame->ChooseDrawMode(paint_.color_filter || paint_.invert_colors,
+                                 matrix_.GetMaxBasisLengthXY());
+  if (draw_mode == TextFrame::DrawMode::kMonoPath ||
+      draw_mode == TextFrame::DrawMode::kColorPaths) {
+    return;
+  }
+
   properties.stroke = paint_.GetStroke();
 
   if (text_frame->HasColor()) {
@@ -1202,6 +1227,16 @@ void FirstPassDispatcher::setStrokeJoin(flutter::DlStrokeJoin join) {
       paint_.stroke.join = Join::kBevel;
       break;
   }
+}
+
+// |flutter::DlOpReceiver|
+void FirstPassDispatcher::setColorFilter(const flutter::DlColorFilter* filter) {
+  paint_.color_filter = filter;
+}
+
+// |flutter::DlOpReceiver|
+void FirstPassDispatcher::setInvertColors(bool invert) {
+  paint_.invert_colors = invert;
 }
 
 // |flutter::DlOpReceiver|

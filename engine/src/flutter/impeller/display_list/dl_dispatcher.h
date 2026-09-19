@@ -426,6 +426,12 @@ class FirstPassDispatcher : public flutter::IgnoreAttributeDispatchHelper,
   void setStrokeJoin(flutter::DlStrokeJoin join) override;
 
   // |flutter::DlOpReceiver|
+  void setColorFilter(const flutter::DlColorFilter* filter) override;
+
+  // |flutter::DlOpReceiver|
+  void setInvertColors(bool invert) override;
+
+  // |flutter::DlOpReceiver|
   void setImageFilter(const flutter::DlImageFilter* filter) override;
 
   std::pair<std::unordered_map<int64_t, BackdropData>, size_t>
