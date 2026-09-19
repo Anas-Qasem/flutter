@@ -10,6 +10,7 @@
 #include "flutter/impeller/base/quran_mem_stats.h"
 #include "flutter/impeller/core/device_buffer.h"
 #include "flutter/impeller/tessellator/path_tessellator.h"
+#include "flutter/impeller/tessellator/path_vertex_cache.h"
 
 namespace {
 static constexpr int kPrecomputedDivisionCount = 1024;
@@ -331,125 +332,10 @@ class ConvexTessellatorImpl : public Tessellator::ConvexTessellator {
   }
 
  private:
-  // One path's tessellated vertices, reused for as long as the path keeps being
-  // drawn at this tolerance.
-  struct CacheEntry {
-    std::vector<Point> points;
-    std::vector<IndexT> indices;
-    size_t point_count = 0u;  // Valid prefix of `points`.
-    size_t index_count = 0u;  // Valid prefix of `indices`; also vertex_count.
-    uint64_t last_used = 0u;
-  };
-
-  // Roughly two pages of Quran glyph outlines. Bounded because an app that
-  // draws a fresh path every frame (an animated shape) would otherwise grow
-  // this without limit.
-  static constexpr size_t kMaxCachedBytes = 24u * 1024u * 1024u;
-
-  static uint64_t MakeCacheKey(uint32_t geometry_id,
-                               Scalar tolerance,
-                               bool supports_primitive_restart,
-                               bool supports_triangle_fan) {
-    // Tolerance decides how finely curves are flattened, so it is part of the
-    // identity. Quantized to 1/16 so that imperceptible scale jitter still
-    // hits.
-    Scalar quantized = std::round(std::clamp(tolerance, 0.0f, 4095.0f) * 16.0f);
-    uint64_t writer = (supports_primitive_restart ? 0b10u : 0u) |
-                      (supports_triangle_fan ? 0b01u : 0u);
-    return (static_cast<uint64_t>(geometry_id) << 32) |
-           (static_cast<uint64_t>(quantized) << 2) | writer;
-  }
-
-  size_t EntryBytes(const CacheEntry& entry) const {
-    return entry.points.capacity() * sizeof(Point) +
-           entry.indices.capacity() * sizeof(IndexT);
-  }
-
-  /// Tessellate `path` once and keep the result under `key`.
-  typename std::unordered_map<uint64_t, CacheEntry>::iterator Populate(
-      uint64_t key,
-      const PathSource& path,
-      Scalar tolerance,
-      bool supports_primitive_restart,
-      bool supports_triangle_fan) {
-    // Cache miss only. Whether a cold page paint is tessellation or something
-    // else is not answerable from the stock trace — Encode has no slices — so
-    // count the misses directly. A page's worth of these in one frame means the
-    // cache key is not matching across widget subtrees.
-    TRACE_EVENT0("impeller", "TessellateCacheMiss");
-    CacheEntry entry;
-    if (supports_primitive_restart) {
-      // The streaming writers need storage sized up front, exactly as the
-      // uncached path sizes its host buffer allocation.
-      const auto [point_count, contour_count] =
-          PathTessellator::CountFillStorage(path, tolerance);
-      entry.points.resize(point_count);
-      entry.indices.resize(point_count + contour_count);
-      if (supports_triangle_fan) {
-        FanPathVertexWriter writer(entry.points.data(), entry.indices.data());
-        PathTessellator::PathToFilledVertices(path, writer, tolerance);
-        entry.point_count = writer.GetPointCount();
-        entry.index_count = writer.GetIndexCount();
-      } else {
-        StripPathVertexWriter writer(entry.points.data(), entry.indices.data());
-        PathTessellator::PathToFilledVertices(path, writer, tolerance);
-        entry.point_count = writer.GetPointCount();
-        entry.index_count = writer.GetIndexCount();
-      }
-      FML_DCHECK(entry.point_count <= point_count);
-      FML_DCHECK(entry.index_count <= point_count + contour_count);
-    } else {
-      DoTessellateConvexInternal(path, entry.points, entry.indices, tolerance);
-      entry.point_count = entry.points.size();
-      entry.index_count = entry.indices.size();
-    }
-
-    // QURAN PATCH 003: trim to the written prefix before accounting.
-    //
-    // `CountFillStorage` returns an UPPER BOUND on storage, and the writers
-    // routinely fill less than that, but `EntryBytes` measures `capacity()`.
-    // Without this the 24 MB budget is spent partly on capacity the entry never
-    // uses, so fewer real paths fit and the miss rate rises. Shrinking costs
-    // one memcpy per cache MISS (never per draw) and is safe because the read
-    // path indexes with `point_count`/`index_count` and never reads `size()`.
-    entry.points.resize(entry.point_count);
-    entry.indices.resize(entry.index_count);
-    entry.points.shrink_to_fit();
-    entry.indices.shrink_to_fit();
-
-    cached_bytes_ += EntryBytes(entry);
-    auto [it, inserted] = cache_.insert_or_assign(key, std::move(entry));
-    if (cached_bytes_ > kMaxCachedBytes) {
-      EvictLeastRecentlyUsed(key);
-    }
-    QuranTessellationBytes().store(static_cast<int64_t>(cached_bytes_));
-    return it;
-  }
-
-  /// Drops the older half of the cache by last use, never `keep`.
-  void EvictLeastRecentlyUsed(uint64_t keep) {
-    std::vector<uint64_t> by_age;
-    by_age.reserve(cache_.size());
-    for (const auto& [key, entry] : cache_) {
-      if (key != keep) {
-        by_age.push_back(key);
-      }
-    }
-    std::sort(by_age.begin(), by_age.end(), [&](uint64_t a, uint64_t b) {
-      return cache_.at(a).last_used < cache_.at(b).last_used;
-    });
-    for (uint64_t key : by_age) {
-      if (cached_bytes_ <= kMaxCachedBytes / 2u) {
-        break;
-      }
-      cached_bytes_ -= EntryBytes(cache_.at(key));
-      cache_.erase(key);
-    }
-  }
-
-  std::unordered_map<uint64_t, CacheEntry> cache_;
-  uint64_t tick_ = 0u;
-  size_t cached_bytes_ = 0u;
+  // QURAN PATCH 009: scale-headroom cache with bounded (intrusive-LRU)
+  // eviction. See path_vertex_cache.h's class comment for the policy this
+  // replaced (quantized-tolerance keying, full-sort eviction) and why.
+  PathVertexCache<IndexT> cache_;
 
  public:
   VertexBuffer TessellateConvex(const PathSource& path,
@@ -462,20 +348,66 @@ class ConvexTessellatorImpl : public Tessellator::ConvexTessellator {
     // it is drawn — Impeller keeps no geometry cache. For text drawn as paths
     // that is ruinous: one page of COLR Quran glyphs re-tessellates ~1000
     // immutable outlines, measured at ~6 ms, and it repeats at 120 Hz. Reuse
-    // the vertices whenever the exact same geometry is filled again at the same
-    // flattening tolerance. Raster-thread only, like the rest of Tessellator.
+    // the vertices whenever the exact same geometry is filled again, at any
+    // flattening scale the cache already covers (QURAN PATCH 009 — see
+    // path_vertex_cache.h). Raster-thread only, like the rest of Tessellator.
     const uint32_t geometry_id = path.GetGeometryID();
     if (geometry_id != 0) {
-      const uint64_t key =
-          MakeCacheKey(geometry_id, tolerance, supports_primitive_restart,
-                       supports_triangle_fan);
-      auto it = cache_.find(key);
-      if (it == cache_.end()) {
-        it = Populate(key, path, tolerance, supports_primitive_restart,
-                      supports_triangle_fan);
-      }
-      CacheEntry& entry = it->second;
-      entry.last_used = ++tick_;
+      const uint8_t writer_variant = (supports_primitive_restart ? 0b10u : 0u) |
+                                     (supports_triangle_fan ? 0b01u : 0u);
+      const typename PathVertexCache<IndexT>::Entry& entry = cache_.Get(
+          geometry_id, writer_variant, tolerance,
+          [&](Scalar flatten_scale,
+              typename PathVertexCache<IndexT>::Entry& entry) {
+            if (supports_primitive_restart) {
+              // The streaming writers need storage sized up front, exactly as
+              // the uncached path sizes its host buffer allocation.
+              const auto [point_count, contour_count] =
+                  PathTessellator::CountFillStorage(path, flatten_scale);
+              entry.points.resize(point_count);
+              entry.indices.resize(point_count + contour_count);
+              if (supports_triangle_fan) {
+                FanPathVertexWriter writer(entry.points.data(),
+                                           entry.indices.data());
+                PathTessellator::PathToFilledVertices(path, writer,
+                                                      flatten_scale);
+                entry.point_count = writer.GetPointCount();
+                entry.index_count = writer.GetIndexCount();
+              } else {
+                StripPathVertexWriter writer(entry.points.data(),
+                                             entry.indices.data());
+                PathTessellator::PathToFilledVertices(path, writer,
+                                                      flatten_scale);
+                entry.point_count = writer.GetPointCount();
+                entry.index_count = writer.GetIndexCount();
+              }
+              FML_DCHECK(entry.point_count <= point_count);
+              FML_DCHECK(entry.index_count <= point_count + contour_count);
+            } else {
+              DoTessellateConvexInternal(path, entry.points, entry.indices,
+                                         flatten_scale);
+              entry.point_count = entry.points.size();
+              entry.index_count = entry.indices.size();
+            }
+
+            // QURAN PATCH 003: trim to the written prefix before accounting.
+            //
+            // `CountFillStorage` returns an UPPER BOUND on storage, and the
+            // writers routinely fill less than that, but bytes are measured
+            // from `capacity()`. Without this the budget is spent partly on
+            // capacity the entry never uses, so fewer real paths fit and the
+            // miss rate rises. Shrinking costs one memcpy per cache miss or
+            // refine (never per draw) and is safe because the read path
+            // indexes with `point_count`/`index_count` and never reads
+            // `size()`.
+            entry.points.resize(entry.point_count);
+            entry.indices.resize(entry.index_count);
+            entry.points.shrink_to_fit();
+            entry.indices.shrink_to_fit();
+          });
+      QuranTessellationBytes().store(
+          static_cast<int64_t>(cache_.GetCachedBytes()));
+
       if (entry.index_count == 0) {
         return VertexBuffer{
             .vertex_buffer = {},

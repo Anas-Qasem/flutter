@@ -8,6 +8,7 @@
 #include "flutter/display_list/geometry/dl_path_builder.h"
 #include "impeller/geometry/constants.h"
 #include "impeller/geometry/geometry_asserts.h"
+#include "impeller/tessellator/path_vertex_cache.h"
 #include "impeller/tessellator/tessellator.h"
 #include "impeller/tessellator/tessellator_libtess.h"
 
@@ -601,6 +602,154 @@ TEST(TessellatorTest, EarlyReturnEmptyConvexShape) {
 
   EXPECT_TRUE(points.empty());
   EXPECT_TRUE(indices.empty());
+}
+
+// QURAN PATCH 009: PathVertexCache is header-only and GPU-free, so it is
+// tested directly here rather than through ConvexTessellatorImpl. Each
+// `flatten` lambda below just records the scale it was called with and fills
+// a controllable number of vertices/indices, shrunk to fit so `EntryBytes`
+// (which measures `capacity()`) is exactly `count * (sizeof(Point) +
+// sizeof(IndexT))` — the same trim `ConvexTessellatorImpl::TessellateConvex`
+// performs for real (QURAN PATCH 003) before handing the entry to the cache.
+
+TEST(TessellatorTest, PathVertexCacheLowerOrEqualScaleHits) {
+  PathVertexCache<uint16_t> cache;
+  std::vector<Scalar> flatten_calls;
+  auto flatten = [&](Scalar scale, PathVertexCache<uint16_t>::Entry& entry) {
+    flatten_calls.push_back(scale);
+    entry.points.assign(4u, Point());
+    entry.indices.assign(4u, 0u);
+    entry.point_count = 4u;
+    entry.index_count = 4u;
+  };
+
+  cache.Get(/*geometry_id=*/1, /*writer_variant=*/0, /*scale=*/3.0f, flatten);
+  ASSERT_EQ(flatten_calls.size(), 1u);
+  EXPECT_EQ(flatten_calls[0], 3.0f);
+
+  // A request at a lower scale, and one at the same scale, both hit: the
+  // entry flattened at 3.0 is a valid (if more precise than necessary) set
+  // of vertices for anything <= 3.0.
+  cache.Get(1, 0, /*scale=*/2.0f, flatten);
+  cache.Get(1, 0, /*scale=*/3.0f, flatten);
+  EXPECT_EQ(flatten_calls.size(), 1u);
+}
+
+TEST(TessellatorTest, PathVertexCacheFinerRequestRefinesWithHeadroomThenHits) {
+  PathVertexCache<uint16_t> cache;
+  std::vector<Scalar> flatten_calls;
+  auto flatten = [&](Scalar scale, PathVertexCache<uint16_t>::Entry& entry) {
+    flatten_calls.push_back(scale);
+    entry.points.assign(4u, Point());
+    entry.indices.assign(4u, 0u);
+    entry.point_count = 4u;
+    entry.index_count = 4u;
+  };
+
+  cache.Get(1, 0, 3.0f, flatten);  // Cold miss: flattens at exactly 3.0.
+  cache.Get(1, 0, 3.5f, flatten);  // Finer: refines at 3.5 * 2.0 = 7.0.
+  EXPECT_EQ(cache.GetEntryCount(), 1u);
+  cache.Get(1, 0, 6.9f, flatten);  // <= 7.0: hits, no flatten.
+  cache.Get(1, 0, 7.1f, flatten);  // Finer again: refines at 7.1 * 2 = 14.2.
+
+  ASSERT_EQ(flatten_calls.size(), 3u);
+  EXPECT_FLOAT_EQ(flatten_calls[0], 3.0f);
+  EXPECT_FLOAT_EQ(flatten_calls[1], 7.0f);
+  EXPECT_FLOAT_EQ(flatten_calls[2], 14.2f);
+}
+
+TEST(TessellatorTest, PathVertexCacheKeysByGeometryIdAndWriterVariant) {
+  PathVertexCache<uint16_t> cache;
+  int flatten_count = 0;
+  auto flatten = [&](Scalar scale, PathVertexCache<uint16_t>::Entry& entry) {
+    flatten_count++;
+    entry.points.assign(4u, Point());
+    entry.indices.assign(4u, 0u);
+    entry.point_count = 4u;
+    entry.index_count = 4u;
+  };
+
+  cache.Get(1, /*writer_variant=*/0, 3.0f, flatten);
+  cache.Get(1, /*writer_variant=*/1, 3.0f, flatten);  // Same geometry, other
+                                                      // writer: new entry.
+  cache.Get(2, /*writer_variant=*/0, 3.0f, flatten);  // Other geometry: new
+                                                      // entry.
+  EXPECT_EQ(flatten_count, 3);
+  EXPECT_EQ(cache.GetEntryCount(), 3u);
+
+  // Re-requesting each at the same scale hits all three; no more flattens.
+  cache.Get(1, 0, 3.0f, flatten);
+  cache.Get(1, 1, 3.0f, flatten);
+  cache.Get(2, 0, 3.0f, flatten);
+  EXPECT_EQ(flatten_count, 3);
+}
+
+TEST(TessellatorTest, PathVertexCacheRefineReplacesOldBytesWithNew) {
+  PathVertexCache<uint16_t> cache;
+  auto make_flatten = [](size_t count) {
+    return [count](Scalar scale, PathVertexCache<uint16_t>::Entry& entry) {
+      entry.points.assign(count, Point());
+      entry.indices.assign(count, 0u);
+      entry.points.shrink_to_fit();
+      entry.indices.shrink_to_fit();
+      entry.point_count = count;
+      entry.index_count = count;
+    };
+  };
+
+  cache.Get(1, 0, 3.0f, make_flatten(10u));
+  const size_t expected_first = 10u * sizeof(Point) + 10u * sizeof(uint16_t);
+  EXPECT_EQ(cache.GetCachedBytes(), expected_first);
+
+  // A finer request replaces the entry; cached bytes must reflect only the
+  // NEW entry, not old + new.
+  cache.Get(1, 0, 100.0f, make_flatten(50u));
+  const size_t expected_after_refine =
+      50u * sizeof(Point) + 50u * sizeof(uint16_t);
+  EXPECT_EQ(cache.GetCachedBytes(), expected_after_refine);
+  EXPECT_EQ(cache.GetEntryCount(), 1u);
+}
+
+TEST(TessellatorTest, PathVertexCacheEvictsLeastRecentlyUsedUnderBudget) {
+  PathVertexCache<uint16_t> cache;
+  int flatten_count = 0;
+  // ~2 MB per entry (Point is 8 bytes, uint16_t index is 2 bytes: 10
+  // bytes/vertex * 200,000 vertices == 2,000,000 bytes).
+  constexpr size_t kEntryVertexCount = 200000u;
+  auto flatten = [&](Scalar scale, PathVertexCache<uint16_t>::Entry& entry) {
+    flatten_count++;
+    entry.points.assign(kEntryVertexCount, Point());
+    entry.indices.assign(kEntryVertexCount, 0u);
+    entry.points.shrink_to_fit();
+    entry.indices.shrink_to_fit();
+    entry.point_count = kEntryVertexCount;
+    entry.index_count = kEntryVertexCount;
+  };
+
+  // Eviction runs on the insert that actually crosses the budget, not
+  // retroactively — 12 entries (~24,000,000 bytes) fit just under the
+  // 24 MiB (25,165,824-byte) cap, so the 13th (~26,000,000 bytes) is the
+  // one that triggers it.
+  constexpr int kEntries = 13;
+  for (int i = 1; i <= kEntries; i++) {
+    cache.Get(static_cast<uint32_t>(i), 0, 3.0f, flatten);
+    // Never exceeds the cap immediately after any insert.
+    EXPECT_LE(cache.GetCachedBytes(), kMaxCachedVertexBytes);
+  }
+  EXPECT_EQ(flatten_count, kEntries);
+  // The crossing insert's eviction brought bytes to at or under half budget.
+  EXPECT_LE(cache.GetCachedBytes(), kMaxCachedVertexBytes / 2u);
+
+  // The most recently inserted entry survives eviction: re-requesting it
+  // hits, no additional flatten.
+  const int flatten_count_before_recheck = flatten_count;
+  cache.Get(static_cast<uint32_t>(kEntries), 0, 3.0f, flatten);
+  EXPECT_EQ(flatten_count, flatten_count_before_recheck);
+
+  // The oldest entry (inserted first) was evicted: requesting it again must
+  // flatten.
+  cache.Get(1, 0, 3.0f, flatten);
+  EXPECT_EQ(flatten_count, flatten_count_before_recheck + 1);
 }
 
 }  // namespace testing
