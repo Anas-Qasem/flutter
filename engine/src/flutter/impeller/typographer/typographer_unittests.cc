@@ -224,6 +224,127 @@ TEST_P(TypographerTest, NonColrColorFontHasNoColorPaths) {
   EXPECT_TRUE(frame->GetColorPaths().empty());
 }
 
+// Mirrors TextFrame::ChooseDrawMode's private kMaxTextScale (text_frame.cc)
+// so the cases below can spell out the arithmetic instead of citing a magic
+// number; not read by production code. If this ever drifts from the real
+// constant, ChooseDrawModeOversizePathAboveMaxTextScale /
+// ChooseDrawModeAtlasBelowMaxTextScale below (12 * 30 vs. 12 * 10) will fail.
+static constexpr Scalar kTestMaxTextScale = 250;
+static_assert(12.0f * 30.0f > kTestMaxTextScale, "test case assumes this");
+static_assert(12.0f * 10.0f <= kTestMaxTextScale, "test case assumes this");
+
+// QURAN PATCH 007 (F1): table test of TextFrame::ChooseDrawMode, which both
+// Canvas::DrawTextFrame (canvas.cc) and FirstPassDispatcher::drawText
+// (dl_dispatcher.cc) call to agree on how a frame will be drawn, so the first
+// pass registers into the lazy glyph atlas only what will actually be drawn
+// from it.
+TEST_P(TypographerTest, ChooseDrawModeMonoPathWhenColorImposedAndPathOk) {
+  std::vector<TextRun> runs;
+  TextFrame frame(
+      runs, Rect::MakeLTRB(0, 0, 10, 10), /*has_color=*/false,
+      /*path_creator=*/
+      []() -> fml::StatusOr<flutter::DlPath> {
+        return flutter::DlPath::MakeRect(flutter::DlRect::MakeLTRB(0, 0, 1, 1));
+      });
+  EXPECT_EQ(frame.ChooseDrawMode(/*imposes_color=*/true, /*max_basis_scale=*/1),
+            TextFrame::DrawMode::kMonoPath);
+}
+
+TEST_P(TypographerTest,
+       ChooseDrawModeFallsThroughToColorPathsWhenMonoPathErrors) {
+  std::vector<TextRun> runs;
+  TextFrame frame(
+      runs, Rect::MakeLTRB(0, 0, 10, 10), /*has_color=*/true,
+      /*path_creator=*/
+      []() -> fml::StatusOr<flutter::DlPath> {
+        return fml::Status(fml::StatusCode::kCancelled, "no outline");
+      },
+      /*color_path_creator=*/
+      []() {
+        std::vector<ColorGlyphLayer> layers(2);
+        return layers;
+      });
+  EXPECT_EQ(frame.ChooseDrawMode(/*imposes_color=*/true, /*max_basis_scale=*/1),
+            TextFrame::DrawMode::kColorPaths);
+}
+
+TEST_P(TypographerTest,
+       ChooseDrawModeFallsThroughToAtlasWhenMonoPathErrorsAndNoColor) {
+  std::vector<TextRun> runs;
+  TextFrame frame(runs, Rect::MakeLTRB(0, 0, 10, 10), /*has_color=*/false,
+                  /*path_creator=*/
+                  []() -> fml::StatusOr<flutter::DlPath> {
+                    return fml::Status(fml::StatusCode::kCancelled,
+                                       "no outline");
+                  });
+  EXPECT_EQ(frame.ChooseDrawMode(/*imposes_color=*/true, /*max_basis_scale=*/1),
+            TextFrame::DrawMode::kAtlas);
+}
+
+TEST_P(TypographerTest, ChooseDrawModeColorPathsWhenNoImposedColor) {
+  std::vector<TextRun> runs;
+  TextFrame frame(runs, Rect::MakeLTRB(0, 0, 10, 10), /*has_color=*/true,
+                  /*path_creator=*/{},
+                  /*color_path_creator=*/
+                  []() {
+                    std::vector<ColorGlyphLayer> layers(1);
+                    return layers;
+                  });
+  EXPECT_EQ(
+      frame.ChooseDrawMode(/*imposes_color=*/false, /*max_basis_scale=*/1),
+      TextFrame::DrawMode::kColorPaths);
+}
+
+TEST_P(TypographerTest, ChooseDrawModeAtlasWhenColorPathsEmpty) {
+  // The bitmap-emoji case: HasColor() is true (CBDT/sbix) but there is no
+  // COLRv0 layer list to extract, so ChooseDrawMode must fall back to the
+  // atlas exactly like NonColrColorFontHasNoColorPaths above expects
+  // GetColorPaths() to.
+  std::vector<TextRun> runs;
+  TextFrame frame(runs, Rect::MakeLTRB(0, 0, 10, 10), /*has_color=*/true,
+                  /*path_creator=*/{},
+                  /*color_path_creator=*/
+                  []() { return std::vector<ColorGlyphLayer>{}; });
+  EXPECT_EQ(
+      frame.ChooseDrawMode(/*imposes_color=*/false, /*max_basis_scale=*/1),
+      TextFrame::DrawMode::kAtlas);
+}
+
+TEST_P(TypographerTest, ChooseDrawModeOversizePathAboveMaxTextScale) {
+  SkFont font = flutter::testing::CreateTestFontOfSize(12);
+  auto frame =
+      MakeTextFrameFromTextBlobSkia(SkTextBlob::MakeFromString("hello", font));
+  ASSERT_EQ(frame->GetFont().GetMetrics().point_size, 12.0f);
+
+  // 12 * 30 = 360 > kTestMaxTextScale (250).
+  EXPECT_EQ(frame->ChooseDrawMode(/*imposes_color=*/false,
+                                  /*max_basis_scale=*/30),
+            TextFrame::DrawMode::kOversizePath);
+}
+
+TEST_P(TypographerTest, ChooseDrawModeAtlasBelowMaxTextScale) {
+  SkFont font = flutter::testing::CreateTestFontOfSize(12);
+  auto frame =
+      MakeTextFrameFromTextBlobSkia(SkTextBlob::MakeFromString("hello", font));
+  ASSERT_EQ(frame->GetFont().GetMetrics().point_size, 12.0f);
+
+  // 12 * 10 = 120 <= kTestMaxTextScale (250).
+  EXPECT_EQ(frame->ChooseDrawMode(/*imposes_color=*/false,
+                                  /*max_basis_scale=*/10),
+            TextFrame::DrawMode::kAtlas);
+}
+
+TEST_P(TypographerTest, ChooseDrawModeDefaultConstructedFrameDoesNotCrash) {
+  // A frame with no runs has no font to read a point size from
+  // (TextFrame::GetFont() indexes runs_[0]). ChooseDrawMode must guard this
+  // rather than crash, and since it has no path/color creators either, the
+  // only sound answer is kAtlas (which, for an empty frame, draws nothing).
+  TextFrame frame;
+  EXPECT_EQ(
+      frame.ChooseDrawMode(/*imposes_color=*/false, /*max_basis_scale=*/30),
+      TextFrame::DrawMode::kAtlas);
+}
+
 // MEASUREMENT (not a correctness test): where does the cost of drawing a page
 // of COLR text actually go? Splits outline decode from layer extraction from
 // tessellation, using a real 2500-upem COLR Quran font. Needs /tmp/hafs_1.ttf

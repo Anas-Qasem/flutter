@@ -2131,11 +2131,6 @@ bool Canvas::AttemptBlurredTextOptimization(
   }
 }
 
-// If the text point size * max basis XY is larger than this value,
-// render the text as paths (if available) for faster and higher
-// fidelity rendering. This is a somewhat arbitrary cutoff
-static constexpr Scalar kMaxTextScale = 250;
-
 void Canvas::DrawTextFrame(const std::shared_ptr<TextFrame>& text_frame,
                            Point position,
                            const Paint& paint) {
@@ -2144,43 +2139,55 @@ void Canvas::DrawTextFrame(const std::shared_ptr<TextFrame>& text_frame,
   // these per style run: if a Quran line's word spans share one style the whole
   // line is one draw, and if they do not it is one per word.
   IMPELLER_TRACE_DRAW("Canvas::DrawTextFrame");
-  // A paint-level color filter (or inversion) imposes the caller's own color on
-  // the text, so the font can contribute no color of its own: every glyph — and
-  // every COLR layer of it — resolves to the same fill. Draw the frame's
-  // outline once as a path: identical pixels, a fraction of the work, and
-  // vector-sharp at any scale, unlike the atlas (which rasterizes at a capped
-  // size).
-  //
-  // Deliberately NOT nested inside HasColor(). It used to be, which meant a run
-  // whose glyphs happen to carry no COLR record fell through to the bitmap
-  // glyph atlas even though the caller had asked for one flat color. In this
-  // app's fonts only ~1500 of ~4600 glyphs carry COLR, so that was not an edge
-  // case: measured on an S23 Ultra (2026-08-05), 932 of 2505 text draws — 37% —
-  // took the atlas branch. It cost the sharpness the vector path exists to
-  // protect, and it dominated the raster thread, because the atlas branch
-  // re-registers every glyph of every frame into the LazyGlyphAtlas on every
-  // frame (the atlas is reset per frame) and pays a CreateGlyphAtlas rebuild
-  // whenever it grows — 15.0 ms inside a single 16.5 ms text draw.
-  if (paint.color_filter || paint.invert_colors) {
-    fml::StatusOr<flutter::DlPath> mono_path = text_frame->GetPath();
-    if (mono_path.ok()) {
+
+  Scalar max_scale = GetCurrentTransform().GetMaxBasisLengthXY();
+  bool imposes_color = paint.color_filter || paint.invert_colors;
+  // TextFrame::ChooseDrawMode (impeller/typographer/text_frame.cc) reproduces
+  // the four branches below in order, with identical short-circuiting, so
+  // that FirstPassDispatcher::drawText (dl_dispatcher.cc) can ask the same
+  // question before the canvas pass runs and register into the lazy glyph
+  // atlas only what will actually be drawn from it.
+  switch (text_frame->ChooseDrawMode(imposes_color, max_scale)) {
+    case TextFrame::DrawMode::kMonoPath:
+    case TextFrame::DrawMode::kOversizePath: {
+      // kMonoPath: a paint-level color filter (or inversion) imposes the
+      // caller's own color on the text, so the font can contribute no color
+      // of its own: every glyph — and every COLR layer of it — resolves to
+      // the same fill. Draw the frame's outline once as a path: identical
+      // pixels, a fraction of the work, and vector-sharp at any scale, unlike
+      // the atlas (which rasterizes at a capped size).
+      //
+      // Deliberately NOT nested inside HasColor() (see kColorPaths below for
+      // what "nested" means here). It used to be, which meant a run whose
+      // glyphs happen to carry no COLR record fell through to the bitmap
+      // glyph atlas even though the caller had asked for one flat color. In
+      // this app's fonts only ~1500 of ~4600 glyphs carry COLR, so that was
+      // not an edge case: measured on an S23 Ultra (2026-08-05), 932 of 2505
+      // text draws — 37% — took the atlas branch. It cost the sharpness the
+      // vector path exists to protect, and it dominated the raster thread,
+      // because the atlas branch re-registers every glyph of every frame into
+      // the LazyGlyphAtlas on every frame (the atlas is reset per frame) and
+      // pays a CreateGlyphAtlas rebuild whenever it grows — 15.0 ms inside a
+      // single 16.5 ms text draw.
+      //
+      // kOversizePath: no color involved, but the current transform scales
+      // the frame's point size past kMaxTextScale — draw as a path instead of
+      // an atlas bitmap for fidelity at zoom. Same draw body as kMonoPath.
       Save(1);
       Concat(Matrix::MakeTranslation(position));
-      DrawPath(mono_path.value(), paint);
+      DrawPath(text_frame->GetPath().value(), paint);
       Restore();
-      return;
+      break;
     }
-    // No outline available (a bitmap-only color font, e.g. CBDT/sbix emoji):
-    // fall through so the glyph atlas handles it as before.
-  }
-  // Color (COLR) text with no imposed color: draw each glyph's color layers as
-  // vector paths so the palette shows through and stays crisp at any scale.
-  if (text_frame->HasColor()) {
-    // Cached on the frame — see TextFrame::GetColorPaths. Bound by reference so
-    // repainting does not copy the layer list every frame.
-    const std::vector<ColorGlyphLayer>& color_layers =
-        text_frame->GetColorPaths();
-    if (!color_layers.empty()) {
+    case TextFrame::DrawMode::kColorPaths: {
+      // Color (COLR) text with no imposed color: draw each glyph's color
+      // layers as vector paths so the palette shows through and stays crisp
+      // at any scale.
+      //
+      // Cached on the frame — see TextFrame::GetColorPaths. Bound by
+      // reference so repainting does not copy the layer list every frame.
+      const std::vector<ColorGlyphLayer>& color_layers =
+          text_frame->GetColorPaths();
       // A drawText op is budgeted exactly one depth slot by the DisplayList
       // (AUTO_DEPTH_WATCHER(1u) in dl_dispatcher.cc), so all layers must share
       // it: the first draw takes the slot and the rest stack on top of it via
@@ -2223,44 +2230,34 @@ void Canvas::DrawTextFrame(const std::shared_ptr<TextFrame>& text_frame,
         first_layer = false;
       }
       Restore();
-      return;
+      break;
+    }
+    case TextFrame::DrawMode::kAtlas: {
+      Entity entity;
+      entity.SetClipDepth(GetClipHeight());
+      entity.SetBlendMode(paint.blend_mode);
+
+      auto text_contents = std::make_shared<TextContents>();
+      text_contents->SetTextFrame(text_frame);
+      text_contents->SetPosition(position);
+      text_contents->SetScreenTransform(GetCurrentTransform());
+      text_contents->SetForceTextColor(paint.mask_blur_descriptor.has_value());
+      text_contents->SetColor(paint.color);
+      text_contents->SetTextProperties(paint.color, paint.GetStroke());
+
+      entity.SetTransform(GetCurrentTransform().Translate(position));
+
+      if (AttemptBlurredTextOptimization(text_frame, text_contents, entity,
+                                         paint)) {
+        break;
+      }
+
+      entity.SetContents(
+          paint.WithFilters(renderer_, std::move(text_contents)));
+      AddRenderEntityToCurrentPass(entity, false);
+      break;
     }
   }
-
-  Scalar max_scale = GetCurrentTransform().GetMaxBasisLengthXY();
-  if (max_scale * text_frame->GetFont().GetMetrics().point_size >
-      kMaxTextScale) {
-    fml::StatusOr<flutter::DlPath> path = text_frame->GetPath();
-    if (path.ok()) {
-      Save(1);
-      Concat(Matrix::MakeTranslation(position));
-      DrawPath(path.value(), paint);
-      Restore();
-      return;
-    }
-  }
-
-  Entity entity;
-  entity.SetClipDepth(GetClipHeight());
-  entity.SetBlendMode(paint.blend_mode);
-
-  auto text_contents = std::make_shared<TextContents>();
-  text_contents->SetTextFrame(text_frame);
-  text_contents->SetPosition(position);
-  text_contents->SetScreenTransform(GetCurrentTransform());
-  text_contents->SetForceTextColor(paint.mask_blur_descriptor.has_value());
-  text_contents->SetColor(paint.color);
-  text_contents->SetTextProperties(paint.color, paint.GetStroke());
-
-  entity.SetTransform(GetCurrentTransform().Translate(position));
-
-  if (AttemptBlurredTextOptimization(text_frame, text_contents, entity,
-                                     paint)) {
-    return;
-  }
-
-  entity.SetContents(paint.WithFilters(renderer_, std::move(text_contents)));
-  AddRenderEntityToCurrentPass(entity, false);
 }
 
 void Canvas::AddRenderSDFEntityToCurrentPass(

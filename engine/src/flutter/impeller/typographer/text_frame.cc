@@ -11,6 +11,18 @@
 
 namespace impeller {
 
+// If the text point size * max basis XY is larger than this value, render the
+// text as paths (if available) for faster and higher fidelity rendering. This
+// is a somewhat arbitrary cutoff.
+//
+// Moved here from canvas.cc so `Canvas::DrawTextFrame` and
+// `FirstPassDispatcher::drawText` (impeller/display_list/dl_dispatcher.cc)
+// can share one answer via `TextFrame::ChooseDrawMode` instead of computing it
+// twice and risking disagreement. NOT the same knob as `kMaximumTextScale`
+// below (48): that one clamps the font size used to rasterize into the glyph
+// atlas, this one decides whether the atlas is used at all.
+static constexpr Scalar kMaxTextScale = 250;
+
 TextFrame::TextFrame() = default;
 
 TextFrame::TextFrame(std::vector<TextRun>& runs,
@@ -138,6 +150,36 @@ const std::vector<ColorGlyphLayer>& TextFrame::GetColorPaths() const {
 
 const Font& TextFrame::GetFont() const {
   return runs_[0].GetFont();
+}
+
+TextFrame::DrawMode TextFrame::ChooseDrawMode(bool imposes_color,
+                                              Scalar max_basis_scale) const {
+  // Branch order and short-circuiting must match Canvas::DrawTextFrame
+  // exactly (impeller/display_list/canvas.cc) — see the comment there for why
+  // branch 1 is deliberately not nested inside HasColor().
+  if (imposes_color) {
+    if (GetPath().ok()) {
+      return DrawMode::kMonoPath;
+    }
+    // No outline available (a bitmap-only color font, e.g. CBDT/sbix emoji):
+    // fall through, same as the canvas does.
+  }
+  if (HasColor()) {
+    if (!GetColorPaths().empty()) {
+      return DrawMode::kColorPaths;
+    }
+  }
+  // A frame with no runs has no font to read a point size from. Nothing
+  // upstream constructs one for real text, but guard it rather than index
+  // runs_[0] out of range via GetFont(): fall straight to the atlas branch,
+  // which does nothing for an empty frame.
+  if (!runs_.empty() &&
+      max_basis_scale * GetFont().GetMetrics().point_size > kMaxTextScale) {
+    if (GetPath().ok()) {
+      return DrawMode::kOversizePath;
+    }
+  }
+  return DrawMode::kAtlas;
 }
 
 std::optional<Glyph> TextFrame::AsSingleGlyph() const {

@@ -156,10 +156,44 @@ class TextFrame {
   ///             frame dominated the cost of scrolling color text.
   const std::vector<ColorGlyphLayer>& GetColorPaths() const;
 
+  //----------------------------------------------------------------------------
+  /// @brief      How `Canvas::DrawTextFrame` will draw this frame, so that
+  ///             other stages (namely `FirstPassDispatcher::drawText`, which
+  ///             registers frames into the lazy glyph atlas before the canvas
+  ///             pass runs) can ask the same question and agree with the
+  ///             canvas about which frames the atlas will actually draw.
+  enum class DrawMode {
+    /// A paint-imposed color (color filter / invert-colors) collapses the
+    /// frame to a single flat outline, drawn as one path.
+    kMonoPath,
+    /// A COLR (color) frame with no imposed paint color: each layer is drawn
+    /// as its own vector path.
+    kColorPaths,
+    /// No color involved, but the current transform scales the frame's point
+    /// size past `kMaxTextScale`: drawn as a single path for fidelity.
+    kOversizePath,
+    /// None of the above: drawn from the (bitmap) glyph atlas.
+    kAtlas,
+  };
+
+  //----------------------------------------------------------------------------
+  /// @brief      Decide how this frame will be drawn, mirroring
+  ///             `Canvas::DrawTextFrame`'s branch order and short-circuiting
+  ///             exactly: `GetPath()`/`GetColorPaths()` are only invoked when
+  ///             the corresponding condition already holds, so a frame that
+  ///             ends up at `kAtlas` (the common case for ordinary UI text)
+  ///             never pays for path extraction.
+  ///
+  /// @param[in]  imposes_color    `paint.color_filter || paint.invert_colors`
+  ///                              at the call site.
+  /// @param[in]  max_basis_scale  `GetCurrentTransform().GetMaxBasisLengthXY()`
+  ///                              at the call site.
+  DrawMode ChooseDrawMode(bool imposes_color, Scalar max_basis_scale) const;
+
  private:
   std::vector<TextRun> runs_;
   Rect bounds_;
-  bool has_color_;
+  bool has_color_ = false;
   const PathCreator path_creator_;
   const ColorPathCreator color_path_creator_;
   std::optional<bool> enable_gamma_correction_ = std::nullopt;
