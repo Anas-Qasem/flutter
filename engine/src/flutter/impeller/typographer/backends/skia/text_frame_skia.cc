@@ -114,6 +114,11 @@ std::vector<Color> ParseCpalPalette0(const sk_sp<SkData>& data) {
 struct ColrV0 {
   const uint8_t* data = nullptr;
   size_t size = 0;
+  // The table's own version field (offset 0). QURAN PATCH 008: this is the
+  // only reliable way to tell "this font has real COLRv0 base/layer records"
+  // from "this font has a COLR table but it's v1 (or later)" — see
+  // ExtractGlyph's use of it below.
+  uint16_t version = 0;
   uint16_t num_base_glyph_records = 0;
   uint32_t base_glyph_records_offset = 0;
   uint32_t layer_records_offset = 0;
@@ -131,6 +136,7 @@ ColrV0 ParseColrV0(const sk_sp<SkData>& data) {
   // offsets, so v1 fonts still get their v0 layers rendered).
   c.data = b;
   c.size = data->size();
+  c.version = ReadU16(b);
   c.num_base_glyph_records = ReadU16(b + 2);
   c.base_glyph_records_offset = ReadU32(b + 4);
   c.layer_records_offset = ReadU32(b + 8);
@@ -292,8 +298,13 @@ struct CachedLayer {
 // Everything needed to draw one glyph, independent of the size it is drawn at.
 struct CachedGlyph {
   std::vector<CachedLayer> layers;
-  // True for a color glyph with no COLRv0 layer list (bitmap emoji, COLRv1):
-  // paths cannot represent it, so the whole frame must fall back to the atlas.
+  // True for a color glyph paths genuinely cannot represent: bitmap emoji
+  // (CBDT/sbix — no COLR table at all) or a COLRv1-only font (a COLR table
+  // whose version is not 0). Set only by ExtractGlyph; see its comment for
+  // why "Skia says this glyph is color" alone is not the test (QURAN PATCH
+  // 008) — a COLRv0 glyph with no base record for THIS glyph id is not this
+  // case, it draws its own outline instead. When true, the whole frame must
+  // fall back to the atlas.
   bool unsupported_color_glyph = false;
 };
 
@@ -326,10 +337,15 @@ void AppendGlyphPath(SkBulkGlyphMetricsAndPaths& paths,
   out->push_back(std::move(layer));
 }
 
-// True when `glyph_id` renders as color pixels rather than as its own outline —
-// a bitmap emoji (CBDT/sbix) or a COLRv1 glyph. Such a glyph cannot be drawn
-// from paths at all: its outline is either empty or a placeholder, so filling
-// it would paint a black silhouette where the color glyph belongs.
+// True when Skia's strike flags `glyph_id` as a color glyph. On CoreText
+// (SkTypeface_mac_ct.cpp's `onFilterRec`) this is set for EVERY glyph of a
+// color-capable font — a whole COLRv0 font included — not just the glyphs
+// that actually carry a base/layer record or a color bitmap. So on its own
+// this bit cannot distinguish "a real bitmap emoji or COLRv1 glyph, which
+// paths truly cannot represent" from "an ordinary outline glyph that simply
+// has no COLRv0 record in an otherwise-COLRv0 font" (see ExtractGlyph, which
+// is the only caller and combines this with the table's own version field to
+// tell the two apart).
 bool GlyphIsColor(SkBulkGlyphMetricsAndPaths& paths, SkGlyphID glyph_id) {
   SkSpan<const SkGlyph*> span = paths.glyphs(SkSpan(&glyph_id, 1));
   return !span.empty() && span[0] != nullptr && span[0]->isColor();
@@ -407,11 +423,30 @@ std::shared_ptr<const CachedGlyph> ExtractGlyph(
       Color color = use_foreground ? Color::Black() : palette[palette_index];
       AppendGlyphPath(paths, layer_gid, color, use_foreground, &glyph->layers);
     }
-  } else if (GlyphIsColor(paths, glyph_id)) {
+  } else if (GlyphIsColor(paths, glyph_id) && !(colr.ok && colr.version == 0)) {
+    // QURAN PATCH 008: a real color glyph paths cannot represent — bitmap
+    // emoji (CBDT/sbix, no COLR table at all: `colr.ok` is false) or a
+    // COLRv1-only glyph (`colr.version != 0`). GlyphIsColor() alone is not
+    // enough to reach this branch: CoreText marks every glyph of a COLRv0
+    // Quran font as "color" too (see GlyphIsColor's comment), even the ~3100
+    // of ~4600 per font that have no base/layer record and are meant to draw
+    // as plain outlines. Only fall back to the atlas when there is no v0
+    // table to have given this glyph a record in the first place.
+    //
+    // Accepted gap: a hybrid font with a real v0 COLR table AND sbix/CBDT
+    // bitmaps for a subset of glyphs would now draw those bitmap glyphs as
+    // (wrong) outlines instead of falling back — no such font exists among
+    // this app's Quran fonts, and detecting the hybrid case would need
+    // parsing sbix/CBDT too, which is out of scope here.
     glyph->unsupported_color_glyph = true;
   } else {
-    // A non-color glyph inside a color frame (e.g. a fallback-font space or
-    // digit): draw its own outline in the foreground (paint) color.
+    // A glyph with no COLRv0 base/layer record, drawn as its own outline in
+    // the foreground (paint) color. Two cases land here: an ordinary
+    // non-color glyph inside a color frame (e.g. a fallback-font space or
+    // digit), and — since PATCH 008 — a Quran word-ligature glyph in a
+    // COLRv0 font that CoreText flags as "color" but that the COLR table
+    // itself never gave a base record (most glyphs in these fonts: only
+    // ~1500 of ~4600 per font carry tajweed color).
     AppendGlyphPath(paths, glyph_id, Color::Black(),
                     /*use_foreground=*/true, &glyph->layers);
   }
