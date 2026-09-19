@@ -4,8 +4,29 @@
 
 import("//build/config/sysroot.gni")
 
+declare_args() {
+  # QURAN BUILD: Xcode 27 SDK `.tbd` stubs list `arm64e.x1` targets the
+  # vendored ld64.lld (Fuchsia LLD 23) rejects as "unknown architecture",
+  # failing every Mac/iOS link; when set, clang is pointed at this linker
+  # instead (Xcode's `ld`).
+  mac_ld_path = ""
+}
+
+# QURAN BUILD: `sdk` (not `mac_dynamic_flags` below) is where this lives
+# because it is the one config `//build/config/BUILDCONFIG.gn` applies to
+# every native target type (executable, shared_library, static_library) on
+# both mac (`is_mac`) and iOS (`is_ios` — see the matching block in
+# `//build/config/ios/BUILD.gn`), via `_native_compiler_configs`.
+# `mac_dynamic_flags`/`mac_executable_flags` below are `is_mac`-only and are
+# not part of an iOS shared_library's default configs (verified: the failing
+# `ios_profile` SOLINK command carries none of their flags), so putting the
+# `--ld-path` override there alone would not fix an iOS link.
 config("sdk") {
   cflags_cc = [ "-stdlib=libc++" ]
+  ldflags = []
+  if (mac_ld_path != "") {
+    ldflags += [ "--ld-path=" + mac_ld_path ]
+  }
 }
 
 # On Mac, this is used for everything except static libraries.

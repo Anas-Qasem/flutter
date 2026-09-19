@@ -2,8 +2,24 @@
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 
+declare_args() {
+  # QURAN BUILD: see the matching declaration and comment in
+  # `//build/config/mac/BUILD.gn` — same rationale, iOS links hit the same
+  # ld64.lld/`.tbd` incompatibility on Xcode 27.
+  mac_ld_path = ""
+}
+
+# QURAN BUILD: this is the config `//build/config/BUILDCONFIG.gn` applies to
+# every native target type (executable, shared_library, static_library) when
+# `is_ios` via `_native_compiler_configs`, so it is where an iOS-wide ldflag
+# override belongs — see the longer comment on the mirrored `sdk` config in
+# `//build/config/mac/BUILD.gn`.
 config("sdk") {
   cflags_cc = [ "-stdlib=libc++" ]
+  ldflags = []
+  if (mac_ld_path != "") {
+    ldflags += [ "--ld-path=" + mac_ld_path ]
+  }
 }
 
 config("ios_application_extension") {
