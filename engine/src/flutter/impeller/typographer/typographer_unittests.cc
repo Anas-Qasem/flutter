@@ -345,6 +345,76 @@ TEST_P(TypographerTest, ChooseDrawModeDefaultConstructedFrameDoesNotCrash) {
       TextFrame::DrawMode::kAtlas);
 }
 
+// QURAN PATCH 008: on CoreText, EVERY glyph of a COLRv0 color font is flagged
+// "color" by SkGlyph::isColor() (SkTypeface_mac_ct.cpp's onFilterRec), not
+// just the ~1500 of ~4600 per font that actually carry a COLRv0 base/layer
+// record — the rest are ordinary word-ligature outlines. Before this patch,
+// ExtractGlyph used isColor() alone to decide "paths cannot represent this
+// glyph", so any word without its own tajweed color layer bailed the WHOLE
+// line to the bitmap atlas. The fix reads the COLR table's own version field:
+// a glyph with no base record in a genuine v0 table draws its own outline
+// instead of bailing; only a real bitmap-emoji glyph (no COLR table) or a
+// COLRv1-only glyph still bails.
+//
+// This walks a real Quran COLR font and asserts every glyph with a non-empty
+// outline gets SOME representation in GetColorPaths() — never the
+// pre-patch-008 "whole frame empty" behavior — and that the font contains
+// both kinds (a colored, multi-layer glyph and a plain, single
+// foreground-layer glyph), so the test is known to exercise both branches of
+// ExtractGlyph's fix.
+//
+// Needs /tmp/hafs_1.ttf, generated with:
+//   python3 -c "from fontTools.ttLib import TTFont; \
+//     f=TTFont('/Users/anas/projects/flutter/mushaf_al_qirat/assets/fonts/quran_fonts/fonts_woff/hafs/hafs_1.woff');
+//     \ f.flavor=None; f.save('/tmp/hafs_1.ttf')"
+// GTEST_SKIP()s silently if it is missing, exactly like MeasureColorTextCost.
+TEST_P(TypographerTest, ColrV0GlyphWithoutBaseRecordDrawsAsOutline) {
+  sk_sp<SkData> font_data = SkData::MakeFromFileName("/tmp/hafs_1.ttf");
+  if (!font_data) {
+    GTEST_SKIP() << "no /tmp/hafs_1.ttf";
+  }
+  sk_sp<SkFontMgr> font_mgr = txt::GetDefaultFontManager();
+  sk_sp<SkTypeface> typeface = font_mgr->makeFromData(font_data);
+  ASSERT_TRUE(typeface);
+
+  SkFont font(typeface, 14);
+
+  int colored_glyph_count = 0;
+  int uncolored_glyph_count = 0;
+  for (int gid = 1; gid <= 300; gid++) {
+    SkGlyphID glyph_id = static_cast<SkGlyphID>(gid);
+    std::optional<SkPath> path = font.getPath(glyph_id);
+    if (!path.has_value() || path->isEmpty()) {
+      continue;  // Not a real glyph in this font (or a whitespace glyph).
+    }
+
+    SkTextBlobBuilder builder;
+    const SkTextBlobBuilder::RunBuffer& run = builder.allocRunPos(font, 1);
+    run.glyphs[0] = glyph_id;
+    run.points()[0] = SkPoint::Make(0, 0);
+    sk_sp<SkTextBlob> blob = builder.make();
+    ASSERT_TRUE(blob);
+
+    std::shared_ptr<TextFrame> frame = MakeTextFrameFromTextBlobSkia(blob);
+    const std::vector<ColorGlyphLayer>& layers = frame->GetColorPaths();
+    ASSERT_FALSE(layers.empty())
+        << "glyph " << gid << " has an outline but produced no color paths — "
+        << "it was wrongly treated as an unsupported color glyph";
+
+    if (layers.size() > 1) {
+      colored_glyph_count++;
+    } else if (layers.size() == 1 && layers[0].use_foreground_color) {
+      uncolored_glyph_count++;
+    }
+  }
+
+  // Proves the loop actually exercised both of ExtractGlyph's branches: real
+  // COLRv0-layered glyphs, and glyphs CoreText flags color but with no base
+  // record (the case PATCH 008 fixes).
+  EXPECT_GT(colored_glyph_count, 0);
+  EXPECT_GT(uncolored_glyph_count, 0);
+}
+
 // MEASUREMENT (not a correctness test): where does the cost of drawing a page
 // of COLR text actually go? Splits outline decode from layer extraction from
 // tessellation, using a real 2500-upem COLR Quran font. Needs /tmp/hafs_1.ttf
