@@ -12,10 +12,15 @@ declare_args() {
   # Whether the PER-DRAW trace points (Canvas::DrawPath, Canvas::DrawTextFrame,
   # RenderPass::EncodeCommands) are compiled in. They fire once per draw call —
   # ~371 DrawPath per raster frame on a page of vector text — so they both cost
-  # raster-thread time and flood the timeline ring buffer. Default ON to keep
-  # existing attribution workflows working; set false for a measurement run
-  # that is free of the observer effect. See impeller/base/trace_draw.h.
-  impeller_trace_per_draw = true
+  # raster-thread time and flood the timeline ring buffer. Default ON for
+  # debug/profile to keep existing attribution workflows working (this is
+  # exactly the benchmark this app's perf work runs against); default OFF for
+  # release (QURAN BUILD) so a shipped build stops paying ~900 timeline clock
+  # reads per raster frame for slices nothing in a release build can read
+  # back. iOS release already compiles the timeline out entirely, so this
+  # only changes Android release; still overridable via `--args`.
+  # See impeller/base/trace_draw.h.
+  impeller_trace_per_draw = flutter_runtime_mode != "release"
 
   # Whether the Metal backend is enabled.
   impeller_enable_metal = (is_mac || is_ios) && target_os != "fuchsia"
