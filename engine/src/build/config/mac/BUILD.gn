@@ -23,6 +23,17 @@ declare_args() {
 # `--ld-path` override there alone would not fix an iOS link.
 config("sdk") {
   cflags_cc = [ "-stdlib=libc++" ]
+  # QURAN BUILD: Xcode 27's `os/trace_base.h` (in the macOS SDK) marks its log
+  # macros with an attribute (`stack_protector_ignore`) the vendored clang
+  # ignores once `-fstack-protector-all` is on — an `is_official_build`/release
+  # flag — which `-Werror` then promotes to a hard error in any release build
+  # that happens to expand one of those macros (hit in `third_party/angle`, a
+  # DEPS checkout with its own `-Werror`, building `host_release`). Silencing
+  # just this warning class, not `-fstack-protector-all` or `-Werror`
+  # themselves, is the minimal fix. Desktop-Mac host targets only (`sdk` here,
+  # not the mirrored one in `//build/config/ios/BUILD.gn`) — the failure is
+  # specific to `-fstack-protector-all` release host builds.
+  cflags = [ "-Wno-ignored-attributes" ]
   ldflags = []
   if (mac_ld_path != "") {
     ldflags += [ "--ld-path=" + mac_ld_path ]
