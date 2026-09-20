@@ -626,6 +626,39 @@ std::shared_ptr<TextFrame> MakeTextFrameFromTextBlobSkia(
       has_color |= glyph->isColor();
     }
 
+    // QURAN PATCH 010: on FreeType (Android), SkGlyph::isColor() is set
+    // per-glyph based on whether THIS glyph actually has a COLR base record —
+    // unlike CoreText (PATCH 008), which flags every glyph of a color-capable
+    // font regardless of whether it has one. So a hafs line where NO word
+    // happens to carry a color record comes back has_color=false here, and
+    // with tajweed on (no paint color filter) ChooseDrawMode sends the whole
+    // frame to the bitmap atlas (branch 4): rasterised fresh at every zoom
+    // scale and blurry, when Quran text must always render as vector paths.
+    // If this run's own typeface has a genuine COLRv0 palette (a `COLR`
+    // table, version 0, with at least one base record), every uncolored
+    // glyph in it is a plain outline that ExtractGlyph (this file) already
+    // emits as a foreground-color layer — so the whole frame can safely take
+    // the color-path branch (2) too, keeping it vector. On CoreText this is a
+    // no-op: has_color is already true there for any glyph of such a font.
+    if (!has_color) {
+      SkTypeface* typeface = run.font().getTypeface();
+      if (typeface != nullptr) {
+        std::shared_ptr<const ColrTables> tables = GetColrTables(typeface);
+        if (tables->colr.ok && tables->colr.version == 0 &&
+            tables->colr.num_base_glyph_records > 0) {
+          has_color = true;
+        }
+      }
+    }
+
+    // QURAN PATCH 010 note: `alignment` only affects the color glyph atlas's
+    // subpixel strike-cache key (TextFrame::ComputeSubpixelPosition, consumed
+    // solely by TextContents::Render and the atlas creation code in
+    // typographer_context_skia.cc — never by GetPath()/GetColorPaths(), which
+    // position glyphs from the untouched transform). A frame PATCH 010 just
+    // flipped to has_color=true gets kNone here instead of kX, but it has
+    // also moved off the atlas branch entirely (branch 4 -> branch 2), so
+    // this value is never read for it. No visible glyph-positioning change.
     AxisAlignment alignment = AxisAlignment::kNone;
     if (run.font().isSubpixel() && run.font().isBaselineSnap() && !has_color) {
       alignment = AxisAlignment::kX;
