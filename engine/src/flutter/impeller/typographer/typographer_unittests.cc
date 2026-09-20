@@ -415,6 +415,81 @@ TEST_P(TypographerTest, ColrV0GlyphWithoutBaseRecordDrawsAsOutline) {
   EXPECT_GT(uncolored_glyph_count, 0);
 }
 
+// QURAN PATCH 010: on FreeType (Android), SkGlyph::isColor() is set
+// per-glyph, so a frame built from only UNCOLORED glyphs of a genuine COLRv0
+// font would otherwise come back HasColor()==false — and with tajweed on (no
+// paint color filter) that sends the whole frame to the bitmap atlas,
+// rasterised fresh and blurry at every zoom scale. This asserts the
+// invariant PATCH 010 establishes: even a single-glyph frame built from one
+// uncolored hafs glyph reports HasColor()==true and
+// GetAtlasType()==kColorBitmap.
+//
+// On CoreText (this test's host, and every Mac/iOS CI runner) the invariant
+// already held before PATCH 010 — CoreText flags every glyph of a
+// color-capable font as color regardless of whether it has a base record
+// (PATCH 008's finding), so `has_color` is already true from the per-glyph
+// scan and PATCH 010's new branch in MakeTextFrameFromTextBlobSkia is never
+// entered here. This test is therefore not a red/green proof of PATCH 010 on
+// this machine — it guards the invariant PATCH 010 is meant to hold on both
+// backends, and would have failed before PATCH 010 on a FreeType host.
+TEST_P(TypographerTest, UncoloredColrV0GlyphFrameReportsHasColor) {
+  sk_sp<SkData> font_data = SkData::MakeFromFileName("/tmp/hafs_1.ttf");
+  if (!font_data) {
+    GTEST_SKIP() << "no /tmp/hafs_1.ttf";
+  }
+  sk_sp<SkFontMgr> font_mgr = txt::GetDefaultFontManager();
+  sk_sp<SkTypeface> typeface = font_mgr->makeFromData(font_data);
+  ASSERT_TRUE(typeface);
+
+  SkFont font(typeface, 14);
+
+  auto make_single_glyph_blob = [&](SkGlyphID glyph_id) {
+    SkTextBlobBuilder builder;
+    const SkTextBlobBuilder::RunBuffer& run = builder.allocRunPos(font, 1);
+    run.glyphs[0] = glyph_id;
+    run.points()[0] = SkPoint::Make(0, 0);
+    return builder.make();
+  };
+
+  std::optional<SkGlyphID> uncolored_glyph_id;
+  for (int gid = 1; gid <= 300; gid++) {
+    SkGlyphID glyph_id = static_cast<SkGlyphID>(gid);
+    std::optional<SkPath> path = font.getPath(glyph_id);
+    if (!path.has_value() || path->isEmpty()) {
+      continue;  // Not a real glyph in this font (or a whitespace glyph).
+    }
+    sk_sp<SkTextBlob> probe_blob = make_single_glyph_blob(glyph_id);
+    ASSERT_TRUE(probe_blob);
+    std::shared_ptr<TextFrame> probe_frame =
+        MakeTextFrameFromTextBlobSkia(probe_blob);
+    const std::vector<ColorGlyphLayer>& layers = probe_frame->GetColorPaths();
+    if (layers.size() == 1 && layers[0].use_foreground_color) {
+      uncolored_glyph_id = glyph_id;
+      break;
+    }
+  }
+  ASSERT_TRUE(uncolored_glyph_id.has_value())
+      << "no uncolored glyph found in the first 300 glyph ids of hafs_1.ttf";
+
+  sk_sp<SkTextBlob> blob = make_single_glyph_blob(*uncolored_glyph_id);
+  ASSERT_TRUE(blob);
+  std::shared_ptr<TextFrame> frame = MakeTextFrameFromTextBlobSkia(blob);
+  EXPECT_TRUE(frame->HasColor());
+  EXPECT_EQ(frame->GetAtlasType(), GlyphAtlas::Type::kColorBitmap);
+}
+
+// Ordinary UI text (no COLR table at all) must not be swept into PATCH 010's
+// fix — GetColrTables() on such a typeface never reports colr.ok, so
+// has_color stays false and this frame keeps drawing from the ordinary alpha
+// glyph atlas.
+TEST_P(TypographerTest, PlainUiFontFrameHasNoColor) {
+  SkFont font = flutter::testing::CreateTestFontOfSize(12);
+  auto blob = SkTextBlob::MakeFromString("settings", font);
+  ASSERT_TRUE(blob);
+  std::shared_ptr<TextFrame> frame = MakeTextFrameFromTextBlobSkia(blob);
+  EXPECT_FALSE(frame->HasColor());
+}
+
 // MEASUREMENT (not a correctness test): where does the cost of drawing a page
 // of COLR text actually go? Splits outline decode from layer extraction from
 // tessellation, using a real 2500-upem COLR Quran font. Needs /tmp/hafs_1.ttf
