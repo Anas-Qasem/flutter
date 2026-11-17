@@ -130,7 +130,7 @@ TEST_P(AiksTest, CanvasCanPushPopCTM) {
 }
 
 TEST_P(AiksTest, DrawColorTextFrameConsumesOneDepthSlot) {
-  ContentContext context(GetContext(), nullptr);
+  ContentContext& context = GetContentContext();
   auto canvas = CreateTestCanvas(context);
 
   // A COLR text frame whose color layers are produced by the creator, the
